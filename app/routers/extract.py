@@ -5,14 +5,13 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile
 
 from app.models.schemas import MCQResponse
-from app.services import ingestion, mcq_parser, ollama_client
+from app.services import ingestion, mcq_parser, mcq_structurer, ocr_processor
 from app.utils.file_utils import cleanup_file, save_upload
 
 router = APIRouter()
 
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 
 
 @router.post("/extract", response_model=MCQResponse)
@@ -28,23 +27,17 @@ async def extract(file: UploadFile):
         all_questions = []
 
         for page_data in pages:
-            raw = None
-            questions = []
+            layout = page_data.layout
 
-            for attempt in range(MAX_RETRIES):
-                try:
-                    raw = await ollama_client.extract_mcqs(page_data)
-                    questions = mcq_parser.parse_mcq_response(raw, page_data.page_num)
-                    break
-                except ValueError:
-                    if attempt == MAX_RETRIES - 1:
-                        # Exhausted retries — skip this page
-                        questions = []
+            if layout is None:
+                # Scanned page or standalone image — run OCR
+                layout = ocr_processor.run(page_data.image_path)
+                layout.page_num = page_data.page_num
 
+            questions = mcq_structurer.structure(layout)
             questions = mcq_parser.attach_images(questions, page_data, MEDIA_DIR)
             all_questions.extend(questions)
 
-            # Clean up full-page PNG (embedded images in media/ are kept)
             if page_data.image_path:
                 cleanup_file(page_data.image_path)
 
@@ -63,12 +56,18 @@ async def extract(file: UploadFile):
 
 @router.get("/health")
 async def health():
-    return await ollama_client.health_check()
+    """Check that the OCR engine can be loaded and required libs are present."""
+    try:
+        import cv2  # noqa: F401
+        from paddleocr import PPStructure  # noqa: F401
+        return {"status": "ok", "ocr_backend": "paddleocr"}
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"OCR backend unavailable: {exc}")
 
 
 @router.get("/models")
 async def models():
-    try:
-        return {"models": await ollama_client.list_models()}
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    """Return info about the active OCR configuration."""
+    lang = os.getenv("OCR_LANG", "en")
+    use_gpu = os.getenv("OCR_USE_GPU", "true").lower() in ("true", "1", "yes")
+    return {"ocr_backend": "paddleocr", "lang": lang, "use_gpu": use_gpu}
